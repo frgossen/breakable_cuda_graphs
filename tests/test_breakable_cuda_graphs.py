@@ -1,5 +1,7 @@
 """Tests for breakable_cuda_graphs."""
 
+import logging
+
 import breakable_cuda_graphs as bcg
 import pytest
 import torch
@@ -319,6 +321,45 @@ def test_graph_break_enable_toggle(enable):
         assert torch.equal(buf, torch.full((5,), val * 3.0 + 1.0, device="cuda"))
 
 
+@requires_cuda
+def test_graph_break_on_bound_method():
+    static_input = torch.empty(5, device="cuda")
+    buf = torch.empty(5, device="cuda")
+
+    class Scaler:
+        def __init__(self, factor: float):
+            self.factor = factor
+
+        @graph_break
+        def scale(self, x: torch.Tensor):
+            x.mul_(self.factor)
+
+    scaler = Scaler(3.0)
+
+    def workload(buf: torch.Tensor, src: torch.Tensor):
+        buf.copy_(src)
+        scaler.scale(buf)
+        buf.add_(1.0)
+
+    seq = CUDAGraphSequence()
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            static_input.fill_(2.0)
+            workload(buf, static_input)
+    torch.cuda.current_stream().wait_stream(s)
+
+    with breakable_graph(seq):
+        workload(buf, static_input)
+
+    for val in [2.0, 5.0]:
+        static_input.fill_(val)
+        seq.replay()
+        assert torch.equal(buf, torch.full((5,), val * 3.0 + 1.0, device="cuda"))
+
+
 # ---------------------------------------------------------------------------
 # Mixed operations — gemm, element-wise, reductions with graph breaks.
 # ---------------------------------------------------------------------------
@@ -556,6 +597,36 @@ def test_graph_break_with_args_kwargs():
         )
 
 
+@requires_cuda
+def test_graph_break_return_value_warning(caplog):
+    static_input = torch.empty(5, device="cuda")
+    result = torch.empty(5, device="cuda")
+
+    @graph_break
+    def compute(x):
+        return x * 3.0
+
+    def all_steps():
+        tmp = compute(static_input)
+        result.copy_(tmp + 1.0)
+
+    seq = CUDAGraphSequence()
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            static_input.fill_(2.0)
+            all_steps()
+    torch.cuda.current_stream().wait_stream(s)
+
+    with caplog.at_level(logging.WARNING, logger="breakable_cuda_graphs"):
+        with breakable_graph(seq):
+            all_steps()
+
+    assert any("requires a copy" in msg for msg in caplog.messages)
+
+
 # ---------------------------------------------------------------------------
 # Edge cases — outside capture, reset, nesting, exceptions.
 # ---------------------------------------------------------------------------
@@ -770,6 +841,59 @@ def test_intra_sequence_pool_sharing():
 
 
 @requires_cuda
+def test_pool_valid_after_reset():
+    static_input = torch.empty(5, device="cuda")
+    buf = torch.empty(5, device="cuda")
+
+    @graph_break
+    def eager_step(x: torch.Tensor):
+        x.mul_(3.0)
+
+    def workload(buf: torch.Tensor, src: torch.Tensor):
+        buf.copy_(src)
+        eager_step(buf)
+        buf.add_(1.0)
+
+    seq = CUDAGraphSequence()
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            static_input.fill_(2.0)
+            workload(buf, static_input)
+    torch.cuda.current_stream().wait_stream(s)
+
+    with breakable_graph(seq):
+        workload(buf, static_input)
+
+    pool_before = seq.pool()
+    seq.reset()
+
+    # After reset, pool() fails because the fresh CUDAGraph hasn't been captured yet.
+    with pytest.raises(RuntimeError, match="without a preceding successful capture"):
+        seq.pool()
+
+    # Recapture using the pool from before reset.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            static_input.fill_(2.0)
+            workload(buf, static_input)
+    torch.cuda.current_stream().wait_stream(s)
+
+    with breakable_graph(seq, pool=pool_before):
+        workload(buf, static_input)
+
+    assert seq.pool() == pool_before
+
+    static_input.fill_(4.0)
+    seq.replay()
+    assert torch.equal(buf, torch.full((5,), 4.0 * 3.0 + 1.0, device="cuda"))
+
+
+@requires_cuda
 def test_multiple_captures_in_sequence():
     static_input = torch.empty(5, device="cuda")
     buf_1 = torch.empty(5, device="cuda")
@@ -912,6 +1036,45 @@ def test_nested_breakable_graph_raises():
             buf.fill_(2.0)
             with breakable_graph(seq2):
                 buf.mul_(3.0)
+
+
+@requires_cuda
+def test_exception_during_resume_capture():
+    buf = torch.empty(5, device="cuda")
+
+    call_count = 0
+
+    @graph_break
+    def eager_step(x: torch.Tensor):
+        nonlocal call_count
+        call_count += 1
+        x.mul_(2.0)
+
+    seq = CUDAGraphSequence()
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            buf.fill_(1.0)
+            eager_step(buf)
+    torch.cuda.current_stream().wait_stream(s)
+
+    original_resume = bcg.breakable_graph._resume_capture
+
+    def failing_resume(self):
+        raise RuntimeError("simulated _resume_capture failure")
+
+    bcg.breakable_graph._resume_capture = failing_resume
+    try:
+        with pytest.raises(RuntimeError, match="simulated _resume_capture failure"):
+            with breakable_graph(seq):
+                buf.fill_(1.0)
+                eager_step(buf)
+    finally:
+        bcg.breakable_graph._resume_capture = original_resume
+
+    assert bcg._current_breakable_graph_ctx.get() is None
 
 
 # ---------------------------------------------------------------------------

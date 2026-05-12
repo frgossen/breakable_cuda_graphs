@@ -1,5 +1,10 @@
 # Breakable CUDA Graphs — Design Document
 
+**Status:** Draft
+**Author:** Frederik Gossen
+**Last Updated:** 2026-05-11
+**Prototype:** https://github.com/frgossen/breakable_cuda_graphs
+
 ## Overview
 
 `breakable-cuda-graphs` is a pure-Python PyTorch annex package that extends
@@ -65,8 +70,9 @@ seq2.replay()
 Instead of capturing into a single `torch.cuda.CUDAGraph`, we capture into a
 sequence of them, interleaved with eager callables. `CUDAGraphSequence`
 represents this captured sequence as a single interleaved list in `_segments`.
-On `replay()`, we iterate the list: graph segments are replayed, callables are
-called.
+The sequence is initialized with one empty `CUDAGraph` — the first segment that
+`breakable_graph.__enter__` will capture into. On `replay()`, we iterate the
+list: graph segments are replayed, callables are called.
 
 We delegate to `torch.cuda.graph` for each segment rather than calling
 `capture_begin`/`capture_end` directly. This means each segment gets the full
@@ -78,7 +84,8 @@ which may be at a different address on each invocation. CUDA graphs expect the
 same addresses for their inputs on replay. To satisfy this constraint, we copy
 the result into a known static buffer captured during the initial run, using
 `torch.utils._pytree.tree_map` to handle arbitrary nested structures (tuples,
-lists, dicts, mixed tensor/non-tensor).
+lists, dicts, mixed tensor/non-tensor). Functions that return `None` (i.e.,
+those that write to pre-allocated buffers) skip copying entirely.
 
 This copy is expensive and almost always avoidable — users can write results to
 a pre-allocated buffer instead. We support returned values for convenience but
@@ -100,11 +107,11 @@ pools across sequences via `breakable_graph(seq2, pool=seq1.pool())`.
 **The problem.** During CUDA graph capture, work can be forked onto side streams and joined back:
 
 ```
-                      fork                   join
-                      |                      |
-main  --[kernel A]----+────[kernel C]────----+----....
-                       \                    /
-side                    +────[kernel B]----+
+                    fork                  join
+                    |                     |
+main  --[kernel A]--+--[kernel C]------+--+ ...
+                     \                /
+side                  +--[kernel B]--+
 ```
 
 A fork happens when a side stream waits on the capturing stream
@@ -118,26 +125,26 @@ If a side stream is still forked when a `@graph_break` triggers, `capture_end()`
 fails with `cudaStreamCaptureUnjoined`:
 
 ```
-                      fork    graph break FAILS
-                      |       |
-main  ──[kernel A]----+──---──+ !! FAILS: side stream not joined
-                       \
-side                    +────[kernel B]---- still dangling
+                    fork    graph break FAILS
+                    |       |
+main  --[kernel A]--+-------+ !! FAILS: side stream not joined
+                     \
+side                  +--[kernel B]-- still dangling
 ```
 
 We must auto-join any dangling side streams before ending each segment:
 
 ```
-                      fork                   auto-join    graph break              new segment
-                      |                      |            |                        |
-main  ──[kernel A]----+────────────────------+------------+----[eager kernel C]──--+----....
-                       \                    /
-side                    +──--[kernel B]──--+
+                    fork                 auto-join    graph break          new segment
+                    |                    |            |                    |
+main  --[kernel A]--+--------------------+------------+--[eager kernel C]--+-- ...
+                     \                  /
+side                  +--[kernel B]----+
 ```
 
 **Our approach: event hooks.** To auto-join, we need to know which streams are currently forked. We track this
 by monkey-patching `torch.cuda.Event.record` and `torch.cuda.Event.wait` at
-import time. All higher-level stream synchronization APIs funnel through these:
+import time. As of PyTorch 2.13, all higher-level stream synchronization APIs funnel through these:
 
 - `Stream.wait_stream(other)` → `self.wait_event(other.record_event())`
 - `Stream.wait_event(event)` → `event.wait(self)`
@@ -161,7 +168,7 @@ bypass the PyTorch API and create forks/joins that our tracking is unaware of
 `capture_end()` fails with `cudaStreamCaptureUnjoined` and raise an
 understandable error.
 
-## Weak References
+## Strong vs. Weak References in Replay Closures
 
 SGLang [PR #22218](https://github.com/sgl-project/sglang/pull/22218) added a
 C++ extension
@@ -205,10 +212,10 @@ because their input tensors are pre-allocated static buffers held alive by the
 runner object, and typical transformer layers *happen to consume inputs before
 allocating large intermediates*. Neither of these is a correctness guarantee.
 
-We use strong references in replay closures. This is always correct regardless
-of tensor provenance, usage pattern, or pool sharing configuration. We could
-support optional unsafe weak-refing as an opt-in mode for users who accept the
-risks.
+We use strong references for both inputs and outputs in replay closures. This is
+always correct regardless of tensor provenance, usage pattern, or pool sharing
+configuration. We could support optional unsafe weak-refing as an opt-in mode
+for users who accept the risks.
 
 ## CUDA GC and Deterministic Cleanup
 
@@ -275,6 +282,17 @@ recommended.
   returns callable wrappers aware of `@graph_break` would be a natural
   extension.
 
+## Repository and Packaging
+
+This package will be a [PyTorch Annex](https://github.com/pytorch/annex)
+dependency — a standalone package listed in the annex repo, analogous to
+[`spmd_types`](https://github.com/meta-pytorch/spmd_types). The code will live
+in its own repo under the [`meta-pytorch`](https://github.com/meta-pytorch)
+GitHub organization.
+
+**Open question: source of truth.** Preference is internal SOT mirrored to OSS.
+The alternative is OSS SOT.
+
 ## Differences from SGLang PR #19102
 
 | Aspect | SGLang PR | Us |
@@ -285,14 +303,14 @@ recommended.
 | Segment storage | Parallel lists (`_segments` + `_break_fns`) | Single interleaved list |
 | Output copying | Explicit `__dict__`/dict/tensor handling | `pytree.tree_map` (handles arbitrary structures) |
 | Decorator API | `@eager_on_graph(enable=True)` (always requires parens) | `@graph_break` or `@graph_break(enable=True)` |
-| Pool sharing | Added post-PR on `main` | Implemented (intra-sequence) |
-| Weak-ref tensors | Added post-PR via C++ extension | TODO |
+| Pool sharing | Merged separately on SGLang `main` after [PR #19102](https://github.com/sgl-project/sglang/pull/19102) | Implemented (intra- and inter-sequence) |
+| Weak-ref tensors | Merged separately via C++ extension ([PR #22218](https://github.com/sgl-project/sglang/pull/22218)) | Strong refs (weak refs deferred; see Weak References section) |
 | GPU resource cleanup | Manual `__del__` on raw handles | Delegates to `torch.cuda.CUDAGraph.__del__` |
 | `reset()` | Not implemented | Implemented |
 
 ## Test Coverage
 
-42 tests covering:
+49 tests covering:
 
 - **Basic capture/replay** — no breaks, drop-in replacement for `torch.cuda.graph`
 - **Graph break placement** — start, middle, end, many breaks, force breaks
@@ -306,3 +324,5 @@ recommended.
 - **Fork/join at graph breaks** — no join, partial join, fork-join-fork-again
 - **Fork/join at end of capture** — join, no join, partial join
 - **Fork/join API variants** — events, wait_stream, mixed
+- **Concurrent captures** — two threads capturing with graph breaks simultaneously
+- **Weak-ref hazard** — verifies strong refs prevent pool-reuse corruption
